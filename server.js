@@ -6,8 +6,12 @@ require('./config/database');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());                                   // must come before the routes
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Serve Bootstrap and fonts from this project, so the site works without internet
+app.use('/vendor/bootstrap', express.static(path.join(__dirname, 'node_modules', 'bootstrap', 'dist')));
+app.use('/vendor/fonts', express.static(path.join(__dirname, 'node_modules', '@fontsource')));
 
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/books', require('./routes/bookRoutes'));

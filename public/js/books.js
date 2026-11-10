@@ -15,6 +15,13 @@ function escapeHtml(text) {
   div.textContent = text ?? '';
   return div.innerHTML;
 }
+// A fixed set of book-cloth colors. A category always gets the same one.
+const SPINES = ['#1F6F78', '#8A3B3B', '#3E5C76', '#6B7A3A', '#7A5C99', '#B7791F', '#2F6B4F', '#9C4A6B'];
+function spineColor(category) {
+  let hash = 0;
+  for (const ch of String(category || '')) hash = (hash * 31 + ch.charCodeAt(0)) % 997;
+  return SPINES[hash % SPINES.length];
+}
 
 function showMessage(text, type, targetId = 'message') {
   document.getElementById(targetId).innerHTML =
@@ -119,8 +126,7 @@ async function loadBooks() {
         </td>` : '';
 
       return `<tr>
-        <td>${escapeHtml(b.title)}</td>
-        <td>${escapeHtml(b.author)}</td>
+        <td class="spine" style="--spine:${spineColor(b.category)}">${escapeHtml(b.title)}</td>        <td>${escapeHtml(b.author)}</td>
         <td>${escapeHtml(b.category)}</td>
         <td>${escapeHtml(b.isbn)}</td>
         <td>${escapeHtml(b.shelf_location)}</td>
@@ -211,5 +217,21 @@ if (isLibrarian) {
   document.getElementById('addBookBtn').classList.remove('d-none');
   document.getElementById('actionsHeader').classList.remove('d-none');
 }
-loadCategories();
-loadBooks();
+
+(async () => {
+  await loadCategories();
+  // Opened from the homepage search box or a category link
+  const query = new URLSearchParams(window.location.search);
+  if (query.get('search')) document.getElementById('searchInput').value = query.get('search');
+  if (query.get('category')) categoryFilter.value = query.get('category');
+  loadBooks();
+})();
+// Underline the menu link of the page you are on
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('#authLinks a.nav-link').forEach((a) => {
+    if (a.getAttribute('href') === window.location.pathname) {
+      a.classList.add('active');
+      a.setAttribute('aria-current', 'page');
+    }
+  });
+});

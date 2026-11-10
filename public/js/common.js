@@ -80,3 +80,12 @@ function requirePage(role) {
   }
   return true;
 }
+// Underline the menu link of the page you are on
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('#authLinks a.nav-link').forEach((a) => {
+    if (a.getAttribute('href') === window.location.pathname) {
+      a.classList.add('active');
+      a.setAttribute('aria-current', 'page');
+    }
+  });
+});
