@@ -1,56 +1,73 @@
-const db = require('../config/database');
+const { User, Book, Issue, Reservation } = require('../models');
 const { todayLocal, lateDays, FINE_PER_DAY } = require('../utils/library');
 const { expireOldReservations } = require('../utils/reservations');
 
 // GET /api/dashboard/stats
-exports.getStats = (req, res) => {
-  const today = todayLocal();
-  expireOldReservations();
+exports.getStats = async (req, res) => {
+  try {
+    const today = todayLocal();
+    await expireOldReservations();
 
-  const one = (sql, ...params) => db.prepare(sql).get(...params);
+    const totals = await Book.aggregate([
+      { $group: {
+          _id: null,
+          titles: { $sum: 1 },
+          copies: { $sum: '$total_copies' },
+          available: { $sum: '$available_copies' }
+      } }
+    ]);
+    const t = totals[0] || { titles: 0, copies: 0, available: 0 };
 
-  const books = one(
-    `SELECT COUNT(*) AS titles,
-            COALESCE(SUM(total_copies), 0) AS copies,
-            COALESCE(SUM(available_copies), 0) AS available
-     FROM books`
-  );
+    const finals = await Issue.find({
+      return_date: { $ne: null }, fine_amount: { $gt: 0 }, fine_paid: 0
+    }).select('fine_amount').lean();
 
-  res.json({
-    total_titles: books.titles,
-    total_copies: books.copies,
-    available_copies: books.available,
-    issued_books: one('SELECT COUNT(*) AS n FROM issues WHERE return_date IS NULL').n,
-    overdue_books: one(
-      'SELECT COUNT(*) AS n FROM issues WHERE return_date IS NULL AND due_date < ?', today
-    ).n,
-    students: one(`SELECT COUNT(*) AS n FROM users WHERE role = 'member'`).n,
-    pending_reservations: one(
-      `SELECT COUNT(*) AS n FROM reservations WHERE status = 'pending'`
-    ).n,
-    unpaid_fines: one(
-      `SELECT COALESCE(SUM(fine_amount), 0) AS total FROM issues
-       WHERE return_date IS NOT NULL AND fine_amount > 0 AND fine_paid = 0`
-    ).total
-  });
+    res.json({
+      total_titles: t.titles,
+      total_copies: t.copies,
+      available_copies: t.available,
+      issued_books: await Issue.countDocuments({ return_date: null }),
+      overdue_books: await Issue.countDocuments({ return_date: null, due_date: { $lt: today } }),
+      students: await User.countDocuments({ role: 'member' }),
+      pending_reservations: await Reservation.countDocuments({ status: 'pending' }),
+      unpaid_fines: finals.reduce((sum, f) => sum + f.fine_amount, 0)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 };
 
 // GET /api/dashboard/overdue
-exports.getOverdue = (req, res) => {
-  const today = todayLocal();
+exports.getOverdue = async (req, res) => {
+  try {
+    const today = todayLocal();
 
-  const rows = db.prepare(
-    `SELECT i.issue_id, i.issue_date, i.due_date,
-            u.full_name, u.email, b.title
-     FROM issues i
-     JOIN users u ON u.user_id = i.user_id
-     JOIN books b ON b.book_id = i.book_id
-     WHERE i.return_date IS NULL AND i.due_date < ?
-     ORDER BY i.due_date ASC`
-  ).all(today);
+    const rows = await Issue.find({ return_date: null, due_date: { $lt: today } })
+      .select('-_id issue_id user_id book_id issue_date due_date').sort({ due_date: 1 }).lean();
 
-  res.json(rows.map((r) => {
-    const late = lateDays(r.due_date, today);
-    return { ...r, late_days: late, fine_amount: late * FINE_PER_DAY };
-  }));
+    const users = await User.find({ user_id: { $in: rows.map((r) => r.user_id) } })
+      .select('user_id full_name email').lean();
+    const books = await Book.find({ book_id: { $in: rows.map((r) => r.book_id) } })
+      .select('book_id title').lean();
+    const userMap = new Map(users.map((u) => [u.user_id, u]));
+    const bookMap = new Map(books.map((b) => [b.book_id, b]));
+
+    res.json(rows.map((r) => {
+      const late = lateDays(r.due_date, today);
+      return {
+        issue_id: r.issue_id,
+        issue_date: r.issue_date,
+        due_date: r.due_date,
+        full_name: userMap.get(r.user_id)?.full_name,
+        email: userMap.get(r.user_id)?.email,
+        title: bookMap.get(r.book_id)?.title,
+        late_days: late,
+        fine_amount: late * FINE_PER_DAY
+      };
+    }));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 };

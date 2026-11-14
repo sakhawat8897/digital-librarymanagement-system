@@ -1,10 +1,19 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const mongoose = require('mongoose');
 
-// Tests set DB_PATH to use a temporary database. Normally the real one is used.
-const dbFile = process.env.DB_PATH || path.join(__dirname, '..', 'database', 'library.db');
+// 127.0.0.1 is used instead of "localhost" because newer Node versions
+// can resolve "localhost" to an address MongoDB is not listening on.
+async function connectDB() {
+  const uri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/digital_library';
 
-const db = new Database(dbFile);
-db.pragma('foreign_keys = ON');
+  await mongoose.connect(uri, { serverSelectionTimeoutMS: 5000 });
 
-module.exports = db;
+  // Make sure the unique indexes (email, ISBN, ids) exist before serving requests
+  const models = require('../models');
+  await Promise.all(
+    ['User', 'Book', 'Issue', 'Reservation', 'Renewal'].map((name) => models[name].init())
+  );
+
+  console.log('MongoDB connected');
+}
+
+module.exports = { connectDB, mongoose };

@@ -1,23 +1,31 @@
-const db = require('../config/database');
-const {
-  todayLocal, addDays, RENEWAL_DAYS, MAX_RENEWALS, BLOCK_ISSUE_IF_UNPAID_FINES
-} = require('./library');
+const { Issue, Renewal, Reservation } = require('../models');
+const { todayLocal, addDays, RENEWAL_DAYS, MAX_RENEWALS, BLOCK_ISSUE_IF_UNPAID_FINES } = require('./library');
 const { expireOldReservations } = require('./reservations');
+const { unpaidFinesOf } = require('./helpers');
 
 // Pending requests for books that were already returned are no longer useful
-function rejectStaleRenewals() {
-  db.prepare(
-    `UPDATE renewals SET status = 'rejected'
-     WHERE status = 'pending'
-       AND issue_id IN (SELECT issue_id FROM issues WHERE return_date IS NOT NULL)`
-  ).run();
+async function rejectStaleRenewals() {
+  const pending = await Renewal.find({ status: 'pending' }).select('issue_id').lean();
+  if (pending.length === 0) return;
+
+  const returned = await Issue.find({
+    issue_id: { $in: pending.map((p) => p.issue_id) },
+    return_date: { $ne: null }
+  }).select('issue_id').lean();
+
+  if (returned.length > 0) {
+    await Renewal.updateMany(
+      { status: 'pending', issue_id: { $in: returned.map((r) => r.issue_id) } },
+      { $set: { status: 'rejected' } }
+    );
+  }
 }
 
 // Decides whether an issue can be renewed.
 // "issue" needs: issue_id, user_id, book_id, due_date, return_date, renewal_count
-function checkRenewable(issue, { ignorePending = false } = {}) {
+async function checkRenewable(issue, { ignorePending = false } = {}) {
   const today = todayLocal();
-  expireOldReservations();
+  await expireOldReservations();
 
   if (issue.return_date) {
     return { ok: false, reason: 'This book was already returned' };
@@ -30,25 +38,19 @@ function checkRenewable(issue, { ignorePending = false } = {}) {
   }
 
   if (!ignorePending) {
-    const pending = db.prepare(
-      `SELECT 1 FROM renewals WHERE issue_id = ? AND status = 'pending'`
-    ).get(issue.issue_id);
+    const pending = await Renewal.exists({ issue_id: issue.issue_id, status: 'pending' });
     if (pending) return { ok: false, reason: 'A renewal request is already pending' };
   }
 
-  const reserved = db.prepare(
-    `SELECT 1 FROM reservations
-     WHERE book_id = ? AND status = 'pending' AND user_id != ?`
-  ).get(issue.book_id, issue.user_id);
+  const reserved = await Reservation.exists({
+    book_id: issue.book_id, status: 'pending', user_id: { $ne: issue.user_id }
+  });
   if (reserved) {
     return { ok: false, reason: 'Another student has reserved this book' };
   }
 
   if (BLOCK_ISSUE_IF_UNPAID_FINES) {
-    const owed = db.prepare(
-      `SELECT COALESCE(SUM(fine_amount), 0) AS total FROM issues
-       WHERE user_id = ? AND return_date IS NOT NULL AND fine_paid = 0`
-    ).get(issue.user_id).total;
+    const owed = await unpaidFinesOf(issue.user_id);
     if (owed > 0) {
       return { ok: false, reason: `Unpaid fines of Rs. ${owed} must be cleared first` };
     }

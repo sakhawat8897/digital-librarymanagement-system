@@ -1,37 +1,42 @@
-const bcrypt = require('bcrypt');          // use 'bcryptjs' if bcrypt failed to install
 const jwt = require('jsonwebtoken');
-const db = require('../config/database');
+const bcrypt = require('../utils/bcrypt');
+const { User, createWithId } = require('../models');
 
 // REGISTER a new student
 exports.register = async (req, res) => {
   try {
-    const { full_name, email, password } = req.body;
+    const { full_name, email, password } = req.body || {};
 
     if (!full_name || !email || !password) {
       return res.status(400).json({ error: 'Name, email and password are required' });
     }
-    if (password.length < 6) {
+    if (String(password).length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    const cleanEmail = email.trim().toLowerCase();
+    const cleanEmail = String(email).trim().toLowerCase();
 
     // Is the email already used?
-    const existing = db.prepare('SELECT user_id FROM users WHERE email = ?').get(cleanEmail);
-    if (existing) {
+    if (await User.exists({ email: cleanEmail })) {
       return res.status(409).json({ error: 'This email is already registered' });
     }
 
     // Hash the password (never store the real password)
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(String(password), 10);
 
-    // Everyone who registers here is a student ('member')
-    const result = db.prepare(
-      `INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, 'member')`
-    ).run(full_name.trim(), cleanEmail, passwordHash);
+    // Everyone who registers here is a student ('member'), whatever the request says
+    const userId = await createWithId(User, 'users', 'user_id', {
+      full_name: String(full_name).trim(),
+      email: cleanEmail,
+      password_hash: passwordHash,
+      role: 'member'
+    });
 
-    res.status(201).json({ message: 'Registration successful', user_id: result.lastInsertRowid });
+    res.status(201).json({ message: 'Registration successful', user_id: userId });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This email is already registered' });
+    }
     console.error(err);
     res.status(500).json({ error: 'Server error' });
   }
@@ -40,13 +45,13 @@ exports.register = async (req, res) => {
 // LOGIN
 exports.login = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.trim().toLowerCase());
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() }).lean();
 
     // Same message for "no user" and "wrong password" (safer)
     if (!user) {
@@ -56,7 +61,7 @@ exports.login = async (req, res) => {
       return res.status(403).json({ error: 'This account is suspended' });
     }
 
-    const passwordOk = await bcrypt.compare(password, user.password_hash);
+    const passwordOk = await bcrypt.compare(String(password), user.password_hash);
     if (!passwordOk) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }

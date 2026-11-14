@@ -35,8 +35,9 @@ npm install
 5. Create the database and the librarian account:
 
 ```
-node database/setup.js
+Install MongoDB Community Server, then:
 node database/createLibrarian.js
+node database/seedBooks.js
 ```
 
 6. Start the server:

@@ -1,110 +1,131 @@
-const db = require('../config/database');
+const { User, Book, Issue, Reservation, createWithId } = require('../models');
 const { todayLocal, addDays, RESERVATION_VALID_DAYS } = require('../utils/library');
+const { HIDE, toId, withUsersAndBooks } = require('../utils/helpers');
 const { expireOldReservations } = require('../utils/reservations');
 
-// queue_position = 1 + number of pending reservations made before this one
-const LIST_SELECT = `
-  SELECT r.reservation_id, r.user_id, r.book_id, r.reservation_date, r.expiry_date, r.status,
-         u.full_name, u.email, b.title, b.author, b.available_copies,
-         (SELECT COUNT(*) FROM reservations r2
-           WHERE r2.book_id = r.book_id AND r2.status = 'pending'
-             AND r2.reservation_id < r.reservation_id) + 1 AS queue_position
-  FROM reservations r
-  JOIN users u ON u.user_id = r.user_id
-  JOIN books b ON b.book_id = r.book_id`;
+// Adds names, queue position and "copy ready" to a list of reservations.
+// queue_position = 1 + the number of pending reservations made before this one.
+async function decorate(rows) {
+  const pending = await Reservation.find({ status: 'pending' })
+    .select('reservation_id book_id').sort({ reservation_id: 1 }).lean();
 
-// A copy is "ready" when enough copies are free for this person's place in the queue
-const addReady = (rows) => rows.map((r) => ({
-  ...r,
-  copy_ready: r.status === 'pending' && r.available_copies >= r.queue_position
-}));
+  const countPerBook = {};
+  const position = new Map();
+  for (const p of pending) {
+    countPerBook[p.book_id] = (countPerBook[p.book_id] || 0) + 1;
+    position.set(p.reservation_id, countPerBook[p.book_id]);
+  }
+
+  const joined = await withUsersAndBooks(rows);
+  return joined.map((r) => {
+    const queue_position = r.status === 'pending' ? position.get(r.reservation_id) : null;
+    return {
+      ...r,
+      queue_position,
+      // A copy is "ready" when enough copies are free for this person's place in the queue
+      copy_ready: r.status === 'pending' && r.available_copies >= queue_position
+    };
+  });
+}
 
 // POST /api/reservations   (students only)
-exports.reserveBook = (req, res) => {
-  const bookId = Number((req.body || {}).book_id);
-  if (!Number.isInteger(bookId)) return res.status(400).json({ error: 'book_id is required' });
+exports.reserveBook = async (req, res) => {
+  try {
+    const bookId = toId((req.body || {}).book_id);
+    if (bookId === null) return res.status(400).json({ error: 'book_id is required' });
 
-  expireOldReservations();
-  const userId = req.user.user_id;
+    await expireOldReservations();
+    const userId = req.user.user_id;
 
-  const account = db.prepare('SELECT status FROM users WHERE user_id = ?').get(userId);
-  if (!account || account.status !== 'active') {
-    return res.status(403).json({ error: 'Your account is suspended' });
+    const account = await User.findOne({ user_id: userId }).select('status').lean();
+    if (!account || account.status !== 'active') {
+      return res.status(403).json({ error: 'Your account is suspended' });
+    }
+
+    const book = await Book.findOne({ book_id: bookId }).lean();
+    if (!book) return res.status(404).json({ error: 'Book not found' });
+
+    if (await Issue.exists({ user_id: userId, book_id: bookId, return_date: null })) {
+      return res.status(409).json({ error: 'You already have this book' });
+    }
+    if (await Reservation.exists({ user_id: userId, book_id: bookId, status: 'pending' })) {
+      return res.status(409).json({ error: 'You already reserved this book' });
+    }
+
+    const pending = await Reservation.countDocuments({ book_id: bookId, status: 'pending' });
+    if (book.available_copies > pending) {
+      return res.status(409).json({ error: 'Copies are available now. Please ask the librarian to issue the book' });
+    }
+
+    const today = todayLocal();
+    const reservationId = await createWithId(Reservation, 'reservations', 'reservation_id', {
+      user_id: userId,
+      book_id: bookId,
+      reservation_date: today,
+      expiry_date: addDays(today, RESERVATION_VALID_DAYS)
+    });
+
+    res.status(201).json({
+      message: `"${book.title}" reserved. Your place in the queue: ${pending + 1}`,
+      reservation_id: reservationId,
+      queue_position: pending + 1
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-
-  const book = db.prepare('SELECT book_id, title, available_copies FROM books WHERE book_id = ?').get(bookId);
-  if (!book) return res.status(404).json({ error: 'Book not found' });
-
-  const hasIt = db.prepare(
-    'SELECT 1 FROM issues WHERE user_id = ? AND book_id = ? AND return_date IS NULL'
-  ).get(userId, bookId);
-  if (hasIt) return res.status(409).json({ error: 'You already have this book' });
-
-  const duplicate = db.prepare(
-    `SELECT 1 FROM reservations WHERE user_id = ? AND book_id = ? AND status = 'pending'`
-  ).get(userId, bookId);
-  if (duplicate) return res.status(409).json({ error: 'You already reserved this book' });
-
-  const pending = db.prepare(
-    `SELECT COUNT(*) AS n FROM reservations WHERE book_id = ? AND status = 'pending'`
-  ).get(bookId).n;
-
-  if (book.available_copies > pending) {
-    return res.status(409).json({ error: 'Copies are available now. Please ask the librarian to issue the book' });
-  }
-
-  const today = todayLocal();
-  const result = db.prepare(
-    'INSERT INTO reservations (user_id, book_id, reservation_date, expiry_date) VALUES (?, ?, ?, ?)'
-  ).run(userId, bookId, today, addDays(today, RESERVATION_VALID_DAYS));
-
-  res.status(201).json({
-    message: `"${book.title}" reserved. Your place in the queue: ${pending + 1}`,
-    reservation_id: Number(result.lastInsertRowid),
-    queue_position: pending + 1
-  });
 };
 
 // GET /api/reservations/my   (any logged-in user)
-exports.getMyReservations = (req, res) => {
-  expireOldReservations();
-  const rows = db.prepare(LIST_SELECT + ' WHERE r.user_id = ? ORDER BY r.reservation_id DESC')
-    .all(req.user.user_id);
-  res.json(addReady(rows));
+exports.getMyReservations = async (req, res) => {
+  try {
+    await expireOldReservations();
+    const rows = await Reservation.find({ user_id: req.user.user_id })
+      .sort({ reservation_id: -1 }).select(HIDE).lean();
+    res.json(await decorate(rows));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 };
 
 // GET /api/reservations?status=pending|fulfilled|cancelled|expired   (librarian)
-exports.getReservations = (req, res) => {
-  expireOldReservations();
-  const valid = ['pending', 'fulfilled', 'cancelled', 'expired'];
-  const { status } = req.query;
+exports.getReservations = async (req, res) => {
+  try {
+    await expireOldReservations();
+    const valid = ['pending', 'fulfilled', 'cancelled', 'expired'];
+    const filter = valid.includes(req.query.status) ? { status: req.query.status } : {};
 
-  let sql = LIST_SELECT;
-  const params = [];
-  if (valid.includes(status)) {
-    sql += ' WHERE r.status = ?';
-    params.push(status);
+    const rows = await Reservation.find(filter)
+      .sort({ book_id: 1, reservation_id: 1 }).select(HIDE).lean();
+    res.json(await decorate(rows));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-  sql += ' ORDER BY r.book_id, r.reservation_id';
-  res.json(addReady(db.prepare(sql).all(...params)));
 };
 
 // PUT /api/reservations/:id/cancel
-exports.cancelReservation = (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid reservation id' });
+exports.cancelReservation = async (req, res) => {
+  try {
+    const id = toId(req.params.id);
+    if (id === null) return res.status(400).json({ error: 'Invalid reservation id' });
 
-  const row = db.prepare('SELECT * FROM reservations WHERE reservation_id = ?').get(id);
-  if (!row) return res.status(404).json({ error: 'Reservation not found' });
+    const row = await Reservation.findOne({ reservation_id: id }).lean();
+    if (!row) return res.status(404).json({ error: 'Reservation not found' });
 
-  const isStaff = req.user.role === 'librarian' || req.user.role === 'admin';
-  if (!isStaff && row.user_id !== req.user.user_id) {
-    return res.status(403).json({ error: 'You can only cancel your own reservations' });
+    const isStaff = req.user.role === 'librarian' || req.user.role === 'admin';
+    if (!isStaff && row.user_id !== req.user.user_id) {
+      return res.status(403).json({ error: 'You can only cancel your own reservations' });
+    }
+    if (row.status !== 'pending') {
+      return res.status(409).json({ error: 'Only pending reservations can be cancelled' });
+    }
+
+    await Reservation.updateOne({ reservation_id: id, status: 'pending' }, { $set: { status: 'cancelled' } });
+    res.json({ message: 'Reservation cancelled' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-  if (row.status !== 'pending') {
-    return res.status(409).json({ error: 'Only pending reservations can be cancelled' });
-  }
-
-  db.prepare(`UPDATE reservations SET status = 'cancelled' WHERE reservation_id = ?`).run(id);
-  res.json({ message: 'Reservation cancelled' });
 };

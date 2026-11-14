@@ -1,4 +1,7 @@
-const db = require('../config/database');
+// Adds sample books (run once): node database/seedBooks.js
+require('dotenv').config();
+const { connectDB, mongoose } = require('../config/database');
+const { Book, createWithId } = require('../models');
 
 const books = [
   ['9780000000011', 'Web Development Basics', 'John Smith', 'Tech Press', 'Computer Science', 2022, 'A-01', 5],
@@ -11,11 +14,23 @@ const books = [
   ['9780000000080', 'English Grammar Guide', 'Ayesha Noor', 'Language Press', 'Language', 2015, 'E-01', 5]
 ];
 
-const insert = db.prepare(
-  `INSERT OR IGNORE INTO books
-   (isbn, title, author, publisher, category, publication_year, shelf_location, total_copies, available_copies)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-);
+(async () => {
+  await connectDB();
 
-for (const b of books) insert.run(...b, b[7]);   // available = total at the start
-console.log('Sample books added.');
+  let added = 0;
+  for (const [isbn, title, author, publisher, category, year, shelf, copies] of books) {
+    if (await Book.exists({ isbn })) continue;
+    await createWithId(Book, 'books', 'book_id', {
+      isbn, title, author, publisher, category,
+      publication_year: year, shelf_location: shelf,
+      total_copies: copies, available_copies: copies
+    });
+    added++;
+  }
+  console.log(`Sample books added: ${added}`);
+
+  await mongoose.disconnect();
+})().catch((err) => {
+  console.error('Failed:', err.message);
+  process.exit(1);
+});

@@ -1,12 +1,12 @@
-const db = require('../config/database');
+const { Reservation } = require('../models');
 const { todayLocal } = require('./library');
 
 // Marks old pending reservations as expired
-function expireOldReservations() {
-  db.prepare(
-    `UPDATE reservations SET status = 'expired'
-     WHERE status = 'pending' AND expiry_date IS NOT NULL AND expiry_date < ?`
-  ).run(todayLocal());
+async function expireOldReservations() {
+  await Reservation.updateMany(
+    { status: 'pending', expiry_date: { $lt: todayLocal() } },
+    { $set: { status: 'expired' } }
+  );
 }
 
 module.exports = { expireOldReservations };

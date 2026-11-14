@@ -1,22 +1,24 @@
-// Full test pass for the Digital Library Management System.
-// Starts its own server on port 3100 with a TEMPORARY database.
+// Full test pass for the Digital Library Management System (MongoDB version).
+// Starts its own server on port 3100 with a TEMPORARY database that is deleted at the end.
 const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const Database = require('better-sqlite3');
-
-let bcrypt;
-try { bcrypt = require('bcryptjs'); } catch (e) { bcrypt = require('bcrypt'); }
+require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true });
+const mongoose = require('mongoose');
 
 const ROOT = path.join(__dirname, '..');
+const bcrypt = require(path.join(ROOT, 'utils', 'bcrypt'));
+const { User, Book, Issue, Reservation, createWithId } = require(path.join(ROOT, 'models'));
 const {
   LOAN_DAYS, FINE_PER_DAY, RENEWAL_DAYS, MAX_RENEWALS, todayLocal, addDays
 } = require(path.join(ROOT, 'utils', 'library'));
 
 const PORT = 3100;
 const BASE = `http://localhost:${PORT}`;
-const DB_FILE = path.join(os.tmpdir(), `library-test-${Date.now()}.db`);
+
+// The same MongoDB server as the app, but a separate database with a unique name
+const baseUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/digital_library';
+const TEST_DB = `library_test_${Date.now()}`;
+const TEST_URI = baseUri.replace(/\/[^/?]*(\?|$)/, `/${TEST_DB}$1`);
 
 // ---------- tiny test framework ----------
 let passed = 0;
@@ -78,14 +80,15 @@ const bookBody = (isbn, title, author, category, copies) => ({
 });
 
 // ---------- the tests ----------
-async function runTests(db) {
+async function runTests() {
   const LATE = 3;
 
   // Moves an issue into the past so it becomes overdue
-  function backdate(issueId, days) {
-    const i = db.prepare('SELECT issue_date, due_date FROM issues WHERE issue_id = ?').get(issueId);
-    db.prepare('UPDATE issues SET issue_date = ?, due_date = ? WHERE issue_id = ?')
-      .run(addDays(i.issue_date, -days), addDays(i.due_date, -days), issueId);
+  async function backdate(issueId, days) {
+    const i = await Issue.findOne({ issue_id: issueId }).lean();
+    await Issue.updateOne({ issue_id: issueId }, {
+      $set: { issue_date: addDays(i.issue_date, -days), due_date: addDays(i.due_date, -days) }
+    });
   }
 
   let r;
@@ -116,7 +119,7 @@ async function runTests(db) {
   check('Registering with role "librarian" still creates a student only',
     !!(sneaky.data && sneaky.data.user && sneaky.data.user.role === 'member'));
 
-  const hashRow = db.prepare('SELECT password_hash FROM users WHERE email = ?').get('sara@test.com');
+  const hashRow = await User.findOne({ email: 'sara@test.com' }).lean();
   check('Password is stored hashed, not as plain text',
     hashRow.password_hash !== '123456' && hashRow.password_hash.startsWith('$2'));
 
@@ -180,6 +183,8 @@ async function runTests(db) {
     arr(r).some((b) => b.book_id === bookC) && arr(r).every((b) => b.category === 'Mathematics'));
   r = await call('GET', '/api/books?search=zzzznotabook');
   check('Search with no match returns an empty list', r.status === 200 && arr(r).length === 0);
+  r = await call('GET', '/api/books?search=' + encodeURIComponent('.*'));
+  check('Special characters in a search are treated as plain text', r.status === 200 && arr(r).length === 0);
   r = await call('GET', '/api/books/categories');
   check('Category list works', arr(r).includes('Mathematics'));
   r = await call('GET', `/api/books/${bookA}`);
@@ -194,6 +199,8 @@ async function runTests(db) {
   r = await call('GET', `/api/books/${bookA}`);
   check('Updating total copies also updates available copies',
     r.data.total_copies === 4 && r.data.available_copies === 4);
+  r = await call('PUT', `/api/books/${bookA}`, LIB, { isbn: 'T-002' });
+  expectStatus('Updating to an ISBN another book uses is rejected', r, 409);
 
   r = await call('POST', '/api/books', LIB, bookBody('T-099', 'Delete Me', 'Nobody', 'Misc', 1));
   const tempBook = r.data.book_id;
@@ -247,6 +254,8 @@ async function runTests(db) {
   expectStatus('Student cannot list all issues', r, 403);
   r = await call('GET', '/api/issues?status=active', LIB);
   check('Active filter works', arr(r).some((i) => i.issue_id === issue1));
+  check('Issue records include the student name and book title',
+    arr(r).some((i) => i.issue_id === issue1 && i.full_name === 'Sara Ahmed' && i.title === 'Test Algorithms'));
 
   r = await call('DELETE', `/api/books/${bookA}`, LIB);
   expectStatus('A book with borrowing history cannot be deleted', r, 409);
@@ -260,6 +269,8 @@ async function runTests(db) {
   check('Available copies go back up after return', r.data.available_copies === availBefore);
   r = await call('PUT', `/api/issues/${issue1}/return`, LIB);
   expectStatus('Returning twice is rejected', r, 409);
+  r = await call('GET', `/api/books/${bookA}`);
+  check('Returning twice does not add an extra copy', r.data.available_copies === availBefore);
   r = await call('PUT', '/api/issues/99999/return', LIB);
   expectStatus('Returning a missing record returns 404', r, 404);
   r = await call('GET', '/api/issues?status=returned', LIB);
@@ -274,11 +285,41 @@ async function runTests(db) {
   r = await call('PUT', `/api/books/${bookB}`, LIB, { total_copies: 0 });
   expectStatus('Total copies cannot go below the number issued', r, 400);
 
+  // Several requests at the very same moment
+  const stamp = Date.now();
+  const crowd = await Promise.all(Array.from({ length: 6 }, (_, n) =>
+    call('POST', '/api/auth/register', null,
+      { full_name: `Crowd ${n}`, email: `crowd${n}-${stamp}@test.com`, password: '123456' })));
+  check('Six students registering at the same moment all succeed',
+    crowd.every((x) => x.status === 201), JSON.stringify(crowd.map((x) => x.status)));
+  check('...and each gets a different user number',
+    new Set(crowd.map((x) => x.data && x.data.user_id)).size === 6);
+
+  const three = await Promise.all([
+    call('POST', '/api/books', LIB, bookBody('T-P1', 'Parallel One', 'Author', 'Science', 2)),
+    call('POST', '/api/books', LIB, bookBody('T-P2', 'Parallel Two', 'Author', 'Science', 2)),
+    call('POST', '/api/books', LIB, bookBody('T-P3', 'Parallel Three', 'Author', 'Science', 2))
+  ]);
+  check('Three books added at the same moment all succeed',
+    three.every((x) => x.status === 201), JSON.stringify(three.map((x) => x.status)));
+  const [bookP1, bookP2, bookP3] = three.map((x) => x.data.book_id);
+
+  const issued = await Promise.all([
+    call('POST', '/api/issues', LIB, { user_id: sara.id, book_id: bookP1 }),
+    call('POST', '/api/issues', LIB, { user_id: ali.id, book_id: bookP2 }),
+    call('POST', '/api/issues', LIB, { user_id: omar.id, book_id: bookP3 })
+  ]);
+  check('Three different books issued at the same moment all succeed',
+    issued.every((x) => x.status === 201), JSON.stringify(issued.map((x) => x.status)));
+  check('...and each issue gets a different number',
+    new Set(issued.map((x) => x.data && x.data.issue_id)).size === 3);
+  for (const x of issued) await call('PUT', `/api/issues/${x.data.issue_id}/return`, LIB);
+
   // ===== 4. Fines =====
   section('4. Fines');
   r = await call('POST', '/api/issues', LIB, { user_id: ali.id, book_id: bookC });
   const issueC = r.data.issue_id;
-  backdate(issueC, LOAN_DAYS + LATE);
+  await backdate(issueC, LOAN_DAYS + LATE);
 
   r = await call('GET', '/api/issues?status=overdue', LIB);
   const overdueRow = arr(r).find((i) => i.issue_id === issueC);
@@ -417,7 +458,7 @@ async function runTests(db) {
 
   r = await call('POST', '/api/reservations', omar.token, { book_id: bookB });
   const resOmar2 = r.data.reservation_id;
-  db.prepare("UPDATE reservations SET expiry_date = '2020-01-01' WHERE reservation_id = ?").run(resOmar2);
+  await Reservation.updateOne({ reservation_id: resOmar2 }, { $set: { expiry_date: '2020-01-01' } });
   r = await call('GET', '/api/reservations/my', omar.token);
   check('Old reservations expire automatically',
     arr(r).some((x) => x.reservation_id === resOmar2 && x.status === 'expired'));
@@ -456,6 +497,8 @@ async function runTests(db) {
   r = await call('GET', '/api/renewals?status=pending', LIB);
   const pend = arr(r).find((x) => x.renewal_id === renew1);
   check('Librarian sees the pending request and can approve it', !!pend && pend.can_approve === true);
+  check('The request shows the student name and book title',
+    !!pend && pend.full_name === 'Ali Khan' && pend.title === 'Queue Test');
 
   r = await call('PUT', `/api/renewals/${renew1}/approve`, ali.token);
   expectStatus('Student cannot approve renewals', r, 403);
@@ -474,6 +517,9 @@ async function runTests(db) {
   r = await call('POST', '/api/renewals', ali.token, { issue_id: issueB_ali });
   check('Maximum number of renewals is enforced',
     r.status === 409 && /maximum/i.test((r.data && r.data.error) || ''), JSON.stringify(r.data));
+  r = await call('GET', '/api/renewals/my', ali.token);
+  check('Student can see their approved renewals',
+    arr(r).filter((x) => x.status === 'approved' && x.title === 'Queue Test').length === MAX_RENEWALS);
 
   // Rejection
   r = await call('POST', '/api/issues', LIB, { user_id: omar.id, book_id: bookA });
@@ -490,7 +536,7 @@ async function runTests(db) {
   expectStatus('Approving a missing request returns 404', r, 404);
 
   // Overdue
-  backdate(issueA_omar, LOAN_DAYS + LATE);
+  await backdate(issueA_omar, LOAN_DAYS + LATE);
   r = await call('POST', '/api/renewals', omar.token, { issue_id: issueA_omar });
   check('An overdue book cannot be renewed',
     r.status === 409 && /overdue/i.test((r.data && r.data.error) || ''), JSON.stringify(r.data));
@@ -546,44 +592,55 @@ async function runTests(db) {
 
   // ===== 8. Data integrity =====
   section('8. Data integrity (checked directly in the database)');
-  const mismatch = db.prepare(
-    `SELECT b.book_id FROM books b
-     WHERE b.available_copies != b.total_copies -
-       (SELECT COUNT(*) FROM issues i WHERE i.book_id = b.book_id AND i.return_date IS NULL)`
-  ).all();
-  check('Available copies always match the books actually out', mismatch.length === 0, JSON.stringify(mismatch));
-  const outOfRange = db.prepare(
-    'SELECT book_id FROM books WHERE available_copies < 0 OR available_copies > total_copies'
-  ).all();
+  const books = await Book.find().lean();
+  const activeIssues = await Issue.find({ return_date: null }).lean();
+
+  const mismatch = books.filter((b) =>
+    b.available_copies !== b.total_copies - activeIssues.filter((i) => i.book_id === b.book_id).length);
+  check('Available copies always match the books actually out', mismatch.length === 0,
+    JSON.stringify(mismatch.map((b) => b.book_id)));
+
+  const outOfRange = books.filter((b) => b.available_copies < 0 || b.available_copies > b.total_copies);
   check('Available copies are never negative or above the total', outOfRange.length === 0);
-  const doubles = db.prepare(
-    `SELECT user_id, book_id FROM issues WHERE return_date IS NULL
-     GROUP BY user_id, book_id HAVING COUNT(*) > 1`
-  ).all();
+
+  const seen = new Set();
+  const doubles = activeIssues.filter((i) => {
+    const key = `${i.user_id}-${i.book_id}`;
+    if (seen.has(key)) return true;
+    seen.add(key);
+    return false;
+  });
   check('No student holds the same book twice', doubles.length === 0);
-  check('No broken foreign keys', db.pragma('foreign_key_check').length === 0);
+
+  const userIds = new Set((await User.find().select('user_id').lean()).map((u) => u.user_id));
+  const bookIds = new Set(books.map((b) => b.book_id));
+  const allIssues = await Issue.find().lean();
+  const broken = allIssues.filter((i) => !userIds.has(i.user_id) || !bookIds.has(i.book_id));
+  check('Every issue points to a real student and a real book', broken.length === 0);
 }
 
 // ---------- start everything, run, clean up ----------
 async function main() {
-  console.log('Preparing a temporary database...');
-  const db = new Database(DB_FILE);
-  db.pragma('foreign_keys = ON');
-  db.exec(fs.readFileSync(path.join(ROOT, 'database', 'schema.sql'), 'utf8'));
-  const libHash = await bcrypt.hash('librarian123', 4);
-  db.prepare(
-    `INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, 'librarian')`
-  ).run('Test Librarian', 'lib@test.com', libHash);
+  console.log(`Preparing a temporary database (${TEST_DB})...`);
+  await mongoose.connect(TEST_URI, { serverSelectionTimeoutMS: 5000 });
+  await Promise.all([User, Book, Issue, Reservation].map((m) => m.init()));
+
+  await createWithId(User, 'users', 'user_id', {
+    full_name: 'Test Librarian',
+    email: 'lib@test.com',
+    password_hash: await bcrypt.hash('librarian123', 4),
+    role: 'librarian'
+  });
 
   console.log(`Starting the server on port ${PORT}...`);
   const server = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), DB_PATH: DB_FILE, JWT_SECRET: 'test-secret-key' }
+    env: { ...process.env, PORT: String(PORT), MONGO_URI: TEST_URI, JWT_SECRET: 'test-secret-key' }
   });
 
   try {
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('The server did not start within 10 seconds')), 10000);
+      const timer = setTimeout(() => reject(new Error('The server did not start within 15 seconds')), 15000);
       server.stdout.on('data', (d) => {
         if (String(d).includes('Server running')) { clearTimeout(timer); resolve(); }
       });
@@ -594,21 +651,22 @@ async function main() {
       });
     });
 
-    await runTests(db);
+    await runTests();
   } catch (err) {
     failed++;
     failures.push('Test run crashed');
-    console.log(`\n[ERROR] ${err.message}`);
+    console.log(`\n[ERROR] ${err.stack || err.message}`);
   } finally {
     server.kill();
-    db.close();
-    await new Promise((r) => setTimeout(r, 500));
-    try { fs.unlinkSync(DB_FILE); } catch (e) { /* ignore */ }
+    try { await mongoose.connection.dropDatabase(); } catch (e) { /* ignore */ }
+    await mongoose.disconnect();
   }
 
-  if (serverErrors.trim()) {
+  // (dotenv prints a harmless "injected env" notice, so ignore that line)
+  const realErrors = serverErrors.split('\n').filter((l) => l.trim() && !l.includes('injected env')).join('\n');
+  if (realErrors) {
     console.log('\n--- Errors printed by the server during the test (these are bugs to fix) ---');
-    console.log(serverErrors.trim());
+    console.log(realErrors);
   }
 
   console.log('\n==============================');
